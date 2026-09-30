@@ -277,6 +277,19 @@ do_install() {
     ask "安装目录" "$_def_base"; BASE="$ASK_A"
     case "$BASE" in ""|"/") echo "安装目录不合法。"; return 1 ;; esac
     export TGWEB_BASE="$BASE"  # 让本脚本后续的 detect_base 能找到刚装好的目录
+    # 先确认目录建得出来、空间够（约需 100MB），免得填完一堆配置才失败
+    _parent="$(dirname "$BASE")"
+    if [ ! -d "$_parent" ]; then echo "父目录不存在: $_parent"; return 1; fi
+    _av="$(df -k "$_parent" 2>/dev/null | awk 'NR==2{print $4}')"
+    case "$_av" in ''|*[!0-9]*) _av=0 ;; esac
+    if [ "$_av" -lt 102400 ] || ! mkdir -p "$BASE" 2>/dev/null; then
+        echo "安装目录不可用: $BASE"
+        echo "  磁盘空间/配额不足（比如 Quota exceeded），安装约需 100MB。"
+        df -h "$_parent" 2>/dev/null
+        echo "  排查：du -sh ${_parent}/* 2>/dev/null | sort -rh | head"
+        echo "  清理出空间后再运行本脚本。"
+        return 1
+    fi
     echo "====== 步骤 4/5：连接方式 ======"
     echo "  1) Cloudflare Tunnel（推荐）——NAT 机、没有公网端口的机器用这个，"
     echo "     cloudflared 向外连 Cloudflare，防火墙什么都不用开"
