@@ -67,25 +67,33 @@ detect_os() {
     echo unknown
 }
 
+# 输出缺失的依赖（空格分隔），$1=系统类型
+check_deps() {
+    _m=""
+    command -v curl >/dev/null 2>&1 || _m="$_m curl"
+    command -v pgrep >/dev/null 2>&1 || _m="$_m procps"
+    command -v tar >/dev/null 2>&1 || _m="$_m tar"
+    if [ "$1" = "alpine" ]; then
+        # gcompat 是库（提供 /lib/ld-linux-x86-64.so.2），没有可执行文件，
+        # 不能用 command -v 检测
+        { [ -e /lib/ld-linux-x86-64.so.2 ] || [ -e /lib64/ld-linux-x86-64.so.2 ]; } \
+            || _m="$_m gcompat"
+    fi
+    printf '%s' "$_m" | sed 's/^ //'
+}
+
 install_deps() {
     _os="$(detect_os)"
-    _missing=""
-    command -v curl >/dev/null 2>&1 || _missing="$_missing curl"
-    command -v pgrep >/dev/null 2>&1 || _missing="$_missing procps"
-    if [ "$_os" = "alpine" ]; then
-        # cloudflared 是 glibc 版，Alpine 跑它需要 gcompat
-        _missing="$_missing gcompat"
-        command -v gcompat >/dev/null 2>&1 && _missing="$(printf '%s' "$_missing" | sed 's/ gcompat//')"
-    fi
-    _missing="$(printf '%s' "$_missing" | sed 's/^ //')"
+    _missing="$(check_deps "$_os")"
     if [ -z "$_missing" ]; then
-        echo "依赖齐全（curl / pgrep 已就绪）。"
+        echo "检测到系统: $_os，依赖齐全。"
         return 0
     fi
     echo "检测到系统: $_os"
     echo "缺失依赖: $_missing"
     echo "  curl    —— 下载安装包、健康检查、TG 推送都要用"
     echo "  procps  —— pgrep/pkill，保活脚本管理进程用"
+    echo "  tar     —— 下载后校验、解压安装包"
     [ "$_os" = "alpine" ] && echo "  gcompat —— Alpine 跑 glibc 版 cloudflared 需要"
     confirm "是否现在自动安装？" || { echo "已跳过，请手动安装后再继续。"; return 1; }
     _sudo=""
@@ -97,27 +105,49 @@ install_deps() {
             return 1
         fi
     fi
+    # 只装确实缺的包
+    _pkgs=""
+    for _d in $_missing; do
+        case "$_d" in
+            curl) _pkgs="$_pkgs curl" ;;
+            procps)
+                case "$_os" in rhel|arch) _pkgs="$_pkgs procps-ng" ;; *) _pkgs="$_pkgs procps" ;; esac ;;
+            tar) _pkgs="$_pkgs tar" ;;
+            gcompat) _pkgs="$_pkgs gcompat" ;;
+        esac
+    done
+    _pkgs="$(printf '%s' "$_pkgs" | sed 's/^ //')"
     case "$_os" in
-        alpine) $_sudo apk add --no-cache curl procps gcompat ;;
-        debian) $_sudo apt-get update && $_sudo apt-get install -y curl procps ;;
+        alpine) $_sudo apk add --no-cache $_pkgs ;;
+        debian) $_sudo apt-get update && $_sudo apt-get install -y $_pkgs ;;
         rhel)
             if command -v dnf >/dev/null 2>&1; then
-                $_sudo dnf install -y curl procps-ng
+                $_sudo dnf install -y $_pkgs
             else
-                $_sudo yum install -y curl procps-ng
+                $_sudo yum install -y $_pkgs
             fi ;;
-        arch) $_sudo pacman -Sy --noconfirm curl procps-ng ;;
+        arch) $_sudo pacman -Sy --noconfirm $_pkgs ;;
         *) echo "未知系统，请手动安装: $_missing"; return 1 ;;
-    esac
+    esac || { echo "依赖安装失败，请手动安装: $_missing"; return 1; }
+    # 装完复检，缺的必须真装上才继续
+    _missing="$(check_deps "$_os")"
+    if [ -n "$_missing" ]; then
+        echo "安装后仍缺失: $_missing，请手动安装后再继续。"
+        return 1
+    fi
+    echo "依赖已就绪。"
 }
 
 # ---------- 安装包 ----------
 download_pkg() {
     for _c in "./$PKG_NAME" "${HOME:-/root}/$PKG_NAME" "/tmp/$PKG_NAME"; do
         if [ -f "$_c" ]; then
-            echo "使用本地安装包: $_c"
-            DOWNLOAD_PKG="$_c"
-            return 0
+            if tar tzf "$_c" >/dev/null 2>&1; then
+                echo "使用本地安装包: $_c"
+                DOWNLOAD_PKG="$_c"
+                return 0
+            fi
+            echo "本地安装包已损坏，忽略: $_c"
         fi
     done
     case "$REPO" in
@@ -127,14 +157,36 @@ download_pkg() {
             return 1 ;;
     esac
     command -v curl >/dev/null 2>&1 || { echo "缺少 curl，无法下载。"; return 1; }
+    # 找个有足够空间的位置下载（包约 33MB，留 100MB 余量）；
+    # /tmp 在小机器上可能是内存文件系统，容易写不下
+    _need_kb=102400
+    _dest=""
+    for _dir in "." "${HOME:-/root}" "/tmp"; do
+        if [ -d "$_dir" ] && [ -w "$_dir" ]; then
+            _av="$(df -k "$_dir" 2>/dev/null | awk 'NR==2{print $4}')"
+            case "$_av" in ''|*[!0-9]*) continue ;; esac
+            if [ "$_av" -ge "$_need_kb" ]; then _dest="$_dir/$PKG_NAME"; break; fi
+        fi
+    done
+    if [ -z "$_dest" ]; then
+        echo "下载中止：本地可用空间不足（需要至少 100MB）。"
+        df -h . 2>/dev/null
+        echo "请清理磁盘空间，或手动把 $PKG_NAME 放到当前目录再运行。"
+        return 1
+    fi
     echo "从 GitHub Releases 下载安装包："
     echo "  $PKG_URL"
-    if curl -fSL --retry 2 -o "/tmp/$PKG_NAME" "$PKG_URL"; then
-        DOWNLOAD_PKG="/tmp/$PKG_NAME"
+    echo "  保存到: $_dest"
+    rm -f "$_dest"
+    if curl -fSL --retry 2 -o "$_dest" "$PKG_URL" && tar tzf "$_dest" >/dev/null 2>&1; then
+        DOWNLOAD_PKG="$_dest"
+        echo "下载完成，校验通过。"
         return 0
     fi
+    rm -f "$_dest"
     echo "下载失败。检查：1) 仓库 $REPO 的 Releases 里有没有 $PKG_NAME；"
-    echo "  2) 本机能否访问 github.com；3) 也可以手动把安装包放到当前目录再运行。"
+    echo "  2) 本机能否访问 github.com；3) 磁盘空间是否足够（df -h 看一下）；"
+    echo "  4) 也可以手动把安装包放到当前目录再运行。"
     return 1
 }
 
