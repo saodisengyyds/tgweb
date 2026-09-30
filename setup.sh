@@ -139,7 +139,10 @@ install_deps() {
 }
 
 # ---------- 安装包 ----------
+# 优先用本地的包；没有则稍后从 GitHub 流式下载（curl | tar 直接解压，
+# 不存 34MB 中间文件，省磁盘空间/配额）
 download_pkg() {
+    DOWNLOAD_PKG=""
     for _c in "./$PKG_NAME" "${HOME:-/root}/$PKG_NAME" "/tmp/$PKG_NAME"; do
         if [ -f "$_c" ]; then
             if tar tzf "$_c" >/dev/null 2>&1; then
@@ -157,37 +160,9 @@ download_pkg() {
             return 1 ;;
     esac
     command -v curl >/dev/null 2>&1 || { echo "缺少 curl，无法下载。"; return 1; }
-    # 找个有足够空间的位置下载（包约 33MB，留 100MB 余量）；
-    # /tmp 在小机器上可能是内存文件系统，容易写不下
-    _need_kb=102400
-    _dest=""
-    for _dir in "." "${HOME:-/root}" "/tmp"; do
-        if [ -d "$_dir" ] && [ -w "$_dir" ]; then
-            _av="$(df -k "$_dir" 2>/dev/null | awk 'NR==2{print $4}')"
-            case "$_av" in ''|*[!0-9]*) continue ;; esac
-            if [ "$_av" -ge "$_need_kb" ]; then _dest="$_dir/$PKG_NAME"; break; fi
-        fi
-    done
-    if [ -z "$_dest" ]; then
-        echo "下载中止：本地可用空间不足（需要至少 100MB）。"
-        df -h . 2>/dev/null
-        echo "请清理磁盘空间，或手动把 $PKG_NAME 放到当前目录再运行。"
-        return 1
-    fi
-    echo "从 GitHub Releases 下载安装包："
+    echo "安装时将从 GitHub Releases 流式下载并解压（不占中间空间）："
     echo "  $PKG_URL"
-    echo "  保存到: $_dest"
-    rm -f "$_dest"
-    if curl -fSL --retry 2 -o "$_dest" "$PKG_URL" && tar tzf "$_dest" >/dev/null 2>&1; then
-        DOWNLOAD_PKG="$_dest"
-        echo "下载完成，校验通过。"
-        return 0
-    fi
-    rm -f "$_dest"
-    echo "下载失败。检查：1) 仓库 $REPO 的 Releases 里有没有 $PKG_NAME；"
-    echo "  2) 本机能否访问 github.com；3) 磁盘空间是否足够（df -h 看一下）；"
-    echo "  4) 也可以手动把安装包放到当前目录再运行。"
-    return 1
+    return 0
 }
 
 # ---------- 保活 ----------
@@ -277,14 +252,14 @@ do_install() {
     ask "安装目录" "$_def_base"; BASE="$ASK_A"
     case "$BASE" in ""|"/") echo "安装目录不合法。"; return 1 ;; esac
     export TGWEB_BASE="$BASE"  # 让本脚本后续的 detect_base 能找到刚装好的目录
-    # 先确认目录建得出来、空间够（约需 100MB），免得填完一堆配置才失败
+    # 先确认目录建得出来、空间够（流式解压约需 80MB），免得填完一堆配置才失败
     _parent="$(dirname "$BASE")"
     if [ ! -d "$_parent" ]; then echo "父目录不存在: $_parent"; return 1; fi
     _av="$(df -k "$_parent" 2>/dev/null | awk 'NR==2{print $4}')"
     case "$_av" in ''|*[!0-9]*) _av=0 ;; esac
-    if [ "$_av" -lt 102400 ] || ! mkdir -p "$BASE" 2>/dev/null; then
+    if [ "$_av" -lt 81920 ] || ! mkdir -p "$BASE" 2>/dev/null; then
         echo "安装目录不可用: $BASE"
-        echo "  磁盘空间/配额不足（比如 Quota exceeded），安装约需 100MB。"
+        echo "  磁盘空间/配额不足（比如 Quota exceeded），安装约需 80MB。"
         df -h "$_parent" 2>/dev/null
         echo "  排查：du -sh ${_parent}/* 2>/dev/null | sort -rh | head"
         echo "  清理出空间后再运行本脚本。"
@@ -325,7 +300,23 @@ do_install() {
     echo "  bot 推送: $([ -n "$_bt" ] && echo '已配置' || echo '未配置（跳过）')"
     confirm "开始安装？" || { echo "已取消。"; return 1; }
     mkdir -p "$BASE" || { echo "无法创建 $BASE"; return 1; }
-    tar -xzf "$DOWNLOAD_PKG" -C "$BASE" || { echo "解压安装包失败"; return 1; }
+    if [ -n "$DOWNLOAD_PKG" ]; then
+        tar -xzf "$DOWNLOAD_PKG" -C "$BASE" || { echo "解压安装包失败"; return 1; }
+    else
+        echo "正在下载并解压安装包（约 33MB，请稍候）..."
+        if curl -fSL --retry 2 "$PKG_URL" | tar -xz -C "$BASE"; then
+            :
+        else
+            echo "下载/解压失败。检查：1) 仓库 $REPO 的 Releases 里有没有 $PKG_NAME；"
+            echo "  2) 本机能否访问 github.com；3) 磁盘空间/配额是否足够（df -h 看一下）；"
+            echo "  4) 也可以在电脑上下载好 $PKG_NAME，传到这台机器当前目录再运行。"
+            return 1
+        fi
+    fi
+    if [ ! -x "$BASE/bin/tproxy-server" ] || [ ! -f "$BASE/tgweb.sh" ]; then
+        echo "安装包不完整（缺少关键文件），请重试或手动放包再运行。"
+        return 1
+    fi
     chmod +x "$BASE/bin/tproxy-server" "$BASE/bin/mtg" "$BASE/bin/cloudflared" 2>/dev/null
     write_conf
     setup_keepalive "$BASE"
